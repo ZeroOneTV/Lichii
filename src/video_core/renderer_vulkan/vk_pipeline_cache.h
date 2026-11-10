@@ -137,6 +137,8 @@ public:
                            TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
+    /// The pipeline for the current 3D state, built or queued when it isn't cached; null when
+    /// the shaders can't be used.
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
     void TickFrame();
@@ -153,6 +155,7 @@ public:
     ///                              every image level it writes holds storage writes.
     [[nodiscard]] bool SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_hold_gpu_data);
 
+    /// Loads the title's disk caches and builds or queues their pipelines.
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
