@@ -1015,6 +1015,27 @@ void PipelineCache::SaveUsedPipelines() {
                               VideoCommon::ShaderCacheV2::EncodeUsed(record));
 }
 
+bool PipelineCache::DynamicAttributeTypesMatch(u64 attribute_types,
+                                                 const GraphicsPipeline& pipeline) const noexcept {
+    if (!dynamic_features.has_dynamic_vertex_input) {
+        return true;
+    }
+    const GraphicsPipelineCacheKey& key = pipeline.Key();
+    std::array<u64, Maxwell::MaxShaderProgram> attribute_masks{};
+    for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
+        if (key.unique_hashes[stage] == 0) {
+            continue;
+        }
+        // The fast-draw serial keeps the same programs as the last full lookup.
+        if (!shader_infos[stage] || shader_infos[stage]->unique_hash != key.unique_hashes[stage]) {
+            return attribute_types == pipeline.DynamicAttributeTypes();
+        }
+        attribute_masks[stage] = shader_infos[stage]->vertex_attribute_mask;
+    }
+    return VideoCommon::KeyedAttributeTypes(attribute_types, key.unique_hashes, attribute_masks) ==
+           pipeline.DynamicAttributeTypes();
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 
     if (!RefreshStages(graphics_key.unique_hashes)) {
@@ -1033,6 +1054,11 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
     if (mesh_draw) {
+        if (dynamic_features.has_dynamic_vertex_input) {
+            // Save the register types: UpdateVertexInput may clear Dirty::VertexInput, and the
+            // next vertex draw must not restore the types of an earlier non-mesh draw.
+            vertex_attribute_types = graphics_key.state.attribute_types;
+        }
         // Before the transitions, which hold the lender's key
         if (!mesh_vertex_inputs_seeded) {
             mesh_vertex_inputs_seeded = true;
@@ -1604,18 +1630,62 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             plan, attribute_masks, [&stop_loading] { return stop_loading.stop_requested(); });
     }
     if (!masked.appends.empty() && !stop_loading.stop_requested()) {
-        std::unordered_set<u64> masked_away;
-        for (const CacheV2::LogAppend& append : masked.appends) {
-            cache_v2->Writer().Append(append.kind, append.key, append.payload);
-            if (append.kind == RecordKind::Tombstone) {
-                masked_away.insert(append.key);
+        // Prefer a capture that translates when several old keys share one masked key
+        for (CacheV2::LogAppend& append : masked.appends) {
+            if (append.kind != RecordKind::Graphics) {
                 continue;
             }
+            const auto cand = masked.candidates.find(append.key);
+            if (cand == masked.candidates.end() || cand->second.size() < 2) {
+                continue;
+            }
+            auto key = PipelineRecordKey<GraphicsPipelineCacheKey>(append.payload);
+            if (!key) {
+                continue;
+            }
+            for (const Vulkan::MaskCandidate& candidate : cand->second) {
+                bool incomplete{};
+                try {
+                    if (TranslateCachedGraphics(candidate.payload, *key, nullptr, incomplete) &&
+                        !incomplete) {
+                        append.payload = candidate.payload;
+                        break;
+                    }
+                } catch (const std::ios_base::failure&) {
+                }
+            }
+        }
+        std::unordered_set<u64> masked_away;
+        // Destination records first, then Used rewrites, then source tombstones: a crash after the
+        // Used rewrite leaves the Used list naming a live key (and the old record still present).
+        for (const CacheV2::LogAppend& append : masked.appends) {
+            if (append.kind != RecordKind::Graphics) {
+                continue;
+            }
+            cache_v2->Writer().Append(append.kind, append.key, append.payload);
             masked_records.push_back({.kind = append.kind,
                                       .flags = 0,
                                       .key = append.key,
                                       .offset = 0,
                                       .payload = append.payload});
+        }
+        std::vector<CacheV2::LogAppend> moves;
+        for (const CacheV2::LogAppend& append : relinked_appends) {
+            moves.push_back({append.kind, append.key, {}});
+        }
+        moves.insert(moves.end(), masked.moves.begin(), masked.moves.end());
+        if (!moves.empty()) {
+            for (const CacheV2::LogAppend& append : RelinkUsedPipelines(
+                     log->parsed.live, moves, MaxUsedPipelineAge(device), used_pipelines)) {
+                cache_v2->Writer().Append(append.kind, append.key, append.payload);
+            }
+        }
+        for (const CacheV2::LogAppend& append : masked.appends) {
+            if (append.kind != RecordKind::Tombstone) {
+                continue;
+            }
+            cache_v2->Writer().Append(append.kind, append.key, append.payload);
+            masked_away.insert(append.key);
         }
         std::erase_if(plan, [&masked_away](const CacheV2::LogRecord* record) {
             return record->kind == RecordKind::Graphics && masked_away.contains(record->key);
@@ -1626,6 +1696,9 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         LOG_INFO(Render_Vulkan,
                  "Shader cache v2: {} pipeline records moved to the vertex attributes they read",
                  masked_away.size());
+        // Already written with the Used rewrite above
+        relinked_appends.clear();
+        masked.moves.clear();
     } else {
         masked.moves.clear();
     }

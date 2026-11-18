@@ -141,6 +141,18 @@ public:
     /// the shaders can't be used.
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
+    /// Saves the unmasked register attribute types for the next CurrentGraphicsPipeline refresh.
+    /// Delta draws that skip that lookup must call this when they clear Dirty::VertexInput.
+    void SaveVertexAttributeTypes(u64 attribute_types) noexcept {
+        if (dynamic_features.has_dynamic_vertex_input) {
+            vertex_attribute_types = attribute_types;
+        }
+    }
+
+    /// Whether register attribute types match pipeline's key after the same masking CurrentGraphicsPipeline uses.
+    [[nodiscard]] bool DynamicAttributeTypesMatch(u64 attribute_types,
+                                                  const GraphicsPipeline& pipeline) const noexcept;
+
     void TickFrame();
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);

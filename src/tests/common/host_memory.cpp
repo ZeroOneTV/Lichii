@@ -431,20 +431,26 @@ TEST_CASE("HostMemory: Move construction transfers the buffer and its mappings",
     u8* const view = source.VirtualBasePointer();
     REQUIRE(backing != nullptr);
     backing[0x1234] = 0x5a;
+    if (view != nullptr) {
+        // Map before the move so the test proves existing mappings survive, not that Map works
+        // after a broken move.
+        source.Map(0x40000, 0x80000, 0x10000, PERMS, HEAP);
+        source.VirtualBasePointer()[0x40000] = 7;
+        REQUIRE(source.BackingBasePointer()[0x80000] == 7);
+    }
 
     HostMemory moved(std::move(source));
-    CHECK(moved.BackingBasePointer() == backing);
-    CHECK(moved.VirtualBasePointer() == view);
-    CHECK(moved.VirtualSize() == MOVE_VIRTUAL_SIZE);
-    CHECK(moved.BackingBasePointer()[0x1234] == 0x5a);
+    REQUIRE(moved.BackingBasePointer() == backing);
+    REQUIRE(moved.VirtualBasePointer() == view);
+    REQUIRE(moved.VirtualSize() == MOVE_VIRTUAL_SIZE);
+    REQUIRE(moved.BackingBasePointer()[0x1234] == 0x5a);
     // The moved-from object owns nothing, so destroying both releases the buffer once.
-    CHECK(source.BackingBasePointer() == nullptr);
-    CHECK(source.VirtualBasePointer() == nullptr);
-    CHECK(source.VirtualSize() == 0);
+    REQUIRE(source.BackingBasePointer() == nullptr);
+    REQUIRE(source.VirtualBasePointer() == nullptr);
+    REQUIRE(source.VirtualSize() == 0);
     if (view != nullptr) {
-        moved.Map(0x40000, 0x80000, 0x10000, PERMS, HEAP);
-        moved.VirtualBasePointer()[0x40000] = 7;
-        CHECK(moved.BackingBasePointer()[0x80000] == 7);
+        REQUIRE(moved.VirtualBasePointer()[0x40000] == 7);
+        REQUIRE(moved.BackingBasePointer()[0x80000] == 7);
     }
 }
 
@@ -453,19 +459,20 @@ TEST_CASE("HostMemory: Move assignment releases the old buffer and keeps the new
     HostMemory source(MOVE_BACKING_SIZE, MOVE_VIRTUAL_SIZE);
     u8* const backing = source.BackingBasePointer();
     REQUIRE(backing != nullptr);
+    REQUIRE(target.BackingBasePointer() != nullptr);
     REQUIRE(target.BackingBasePointer() != backing);
     backing[0] = 0x11;
 
     target = std::move(source);
-    CHECK(target.BackingBasePointer() == backing);
-    CHECK(target.BackingBasePointer()[0] == 0x11);
-    CHECK(source.BackingBasePointer() == nullptr);
+    REQUIRE(target.BackingBasePointer() == backing);
+    REQUIRE(target.BackingBasePointer()[0] == 0x11);
+    REQUIRE(source.BackingBasePointer() == nullptr);
 
     // Assigning to itself keeps the buffer.
     HostMemory& alias = target;
     target = std::move(alias);
-    CHECK(target.BackingBasePointer() == backing);
-    CHECK(target.BackingBasePointer()[0] == 0x11);
+    REQUIRE(target.BackingBasePointer() == backing);
+    REQUIRE(target.BackingBasePointer()[0] == 0x11);
 }
 
 TEST_CASE("HostMemory: Repeated create and destroy cycles succeed", "[common][host_memory_move]") {

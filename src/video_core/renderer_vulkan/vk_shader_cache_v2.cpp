@@ -7,6 +7,8 @@
 #include <fstream>
 #include <istream>
 #include <map>
+#include <optional>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -392,19 +394,53 @@ std::unordered_map<u64, u64> ProgramAttributeMasks(std::span<const ShaderCacheV2
     return masks;
 }
 
+namespace {
+/// VertexB SPH input map from a graphics record payload; nullopt when the record has no native
+/// VertexB environment (task/mesh) or cannot be read.
+std::optional<u64> VertexBAttributeMaskFromPayload(std::span<const u8> payload) {
+    std::vector<VideoCommon::FileEnvironment> envs;
+    Common::UniqueFunction<void, std::istream&, VideoCommon::FileEnvironment> read_compute{
+        [](std::istream&, VideoCommon::FileEnvironment) {
+            throw std::ios_base::failure("Compute pipeline in another kind of record");
+        }};
+    Common::UniqueFunction<void, std::istream&, std::vector<VideoCommon::FileEnvironment>> read_graphics{
+        [&](std::istream& file, std::vector<VideoCommon::FileEnvironment> read) {
+            GraphicsPipelineCacheKey read_key;
+            file.read(reinterpret_cast<char*>(&read_key), sizeof(read_key));
+            VideoCommon::CheckGraphicsRecord(read_key.unique_hashes, read.size());
+            envs = std::move(read);
+        }};
+    try {
+        VideoCommon::ReadPipelinePayload(payload, read_compute, read_graphics);
+    } catch (const std::ios_base::failure&) {
+        return std::nullopt;
+    }
+    for (const VideoCommon::FileEnvironment& env : envs) {
+        if (env.ShaderStage() != Shader::Stage::VertexB || !env.IsNativeProgram()) {
+            continue;
+        }
+        std::array<std::array<bool, 4>, Tegra::Engines::Maxwell3D::Regs::NumVertexAttributes>
+            input_generic{};
+        for (size_t index = 0; index < input_generic.size(); ++index) {
+            input_generic[index] = env.SPH().vtg.InputGeneric(index);
+        }
+        return VideoCommon::VertexAttributeMask(input_generic);
+    }
+    return std::nullopt;
+}
+} // Anonymous namespace
+
 MaskedPipelineRecords MaskPipelineAttributeTypes(
     std::span<const ShaderCacheV2::LogRecord* const> records,
     const std::unordered_map<u64, u64>& masks, const std::function<bool()>& stop) {
     MaskedPipelineRecords result;
-    if (masks.empty()) {
-        return result;
-    }
     std::unordered_set<u64> graphics_keys;
     for (const ShaderCacheV2::LogRecord* const record : records) {
         if (record->kind == RecordKind::Graphics) {
             graphics_keys.insert(record->key);
         }
     }
+    constexpr size_t VertexB = static_cast<size_t>(Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB);
     for (const ShaderCacheV2::LogRecord* const record : records) {
         if (stop && stop()) {
             break;
@@ -422,12 +458,26 @@ MaskedPipelineRecords MaskPipelineAttributeTypes(
             if (key->unique_hashes[stage] == 0) {
                 continue;
             }
-            const auto it = masks.find(key->unique_hashes[stage]);
-            if (it == masks.end()) {
+            if (const auto it = masks.find(key->unique_hashes[stage]); it != masks.end()) {
+                attribute_masks[stage] = it->second;
+                continue;
+            }
+            // Program masks are present: a missing hash means leave the record alone (task/mesh).
+            if (!masks.empty()) {
                 known = false;
                 break;
             }
-            attribute_masks[stage] = it->second;
+            // Legacy-converted caches have no Program records: take VertexB from the payload SPH.
+            if (stage == VertexB) {
+                if (const auto derived = VertexBAttributeMaskFromPayload(record->payload)) {
+                    attribute_masks[stage] = *derived;
+                    continue;
+                }
+                known = false;
+                break;
+            }
+            // Same as ProgramAttributeMasks for non-VertexB stages
+            attribute_masks[stage] = ~u64{0};
         }
         if (!known) {
             continue;
@@ -439,10 +489,11 @@ MaskedPipelineRecords MaskPipelineAttributeTypes(
         }
         key->state.attribute_types = attribute_types;
         const u64 new_key = GraphicsRecordKey(*key);
+        std::vector<u8> payload(record->payload.begin(), record->payload.end());
+        std::memcpy(payload.data() + payload.size() - sizeof(*key), &*key, sizeof(*key));
+        result.candidates[new_key].push_back({record->key, payload});
         // Records that differed only in unread attribute types share the masked key
         if (graphics_keys.insert(new_key).second) {
-            std::vector<u8> payload(record->payload.begin(), record->payload.end());
-            std::memcpy(payload.data() + payload.size() - sizeof(*key), &*key, sizeof(*key));
             result.appends.push_back({RecordKind::Graphics, new_key, std::move(payload)});
         }
         result.appends.push_back({RecordKind::Tombstone, record->key,

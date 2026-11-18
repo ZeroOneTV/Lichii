@@ -109,6 +109,11 @@ struct RekeyedRecord {
 [[nodiscard]] std::unordered_map<u64, u64> ProgramAttributeMasks(
     std::span<const VideoCommon::ShaderCacheV2::LogRecord> live);
 
+struct MaskCandidate {
+    u64 old_key{};
+    std::vector<u8> payload; ///< Graphics payload with the masked key already written
+};
+
 struct MaskedPipelineRecords {
     /// Each moved record's new record, unless a graphics record already holds its key, then a
     /// tombstone for its old key
@@ -116,12 +121,16 @@ struct MaskedPipelineRecords {
     /// Each move as its new key's graphics record and its old key's tombstone, without payloads
     /// (for RelinkUsedPipelines)
     std::vector<VideoCommon::ShaderCacheV2::LogAppend> moves;
+    /// Every old record that collapsed into a masked key, so boot can pick one that translates
+    std::unordered_map<u64, std::vector<MaskCandidate>> candidates;
 };
 
 /// Moves the graphics records among `records` keyed with vertex attribute types their programs
-/// never read to the key the pipeline cache looks them up with (KeyedAttributeTypes). A record with
-/// a program missing from `masks` (task and mesh pipelines, whose keys mix in the mesh state) is
-/// left alone.
+/// never read to the key the pipeline cache looks them up with (KeyedAttributeTypes). When `masks`
+/// has no entry for a VertexB hash, the mask is taken from that stage's SPH in the record payload
+/// (legacy-converted caches have no Program records). Other stages default to all attributes. A
+/// record whose VertexB mask still cannot be told (task and mesh pipelines, whose keys mix in the
+/// mesh state) is left alone.
 [[nodiscard]] MaskedPipelineRecords MaskPipelineAttributeTypes(
     std::span<const VideoCommon::ShaderCacheV2::LogRecord* const> records,
     const std::unordered_map<u64, u64>& masks, const std::function<bool()>& stop = {});
